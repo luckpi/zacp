@@ -130,6 +130,7 @@ type SessionService struct {
 	workspaceRepo *store.WorkspaceRepository
 	sessionRepo   *store.SessionRepository
 	msgRepo       *store.MessageRepository
+	streamRepo    *store.StreamEventRepository
 	mgr           *manager.Manager
 	// defaultCwd 是 config session.default_cwd；创建会话未指定工作区时的回退路径。
 	defaultCwd string
@@ -141,11 +142,12 @@ type SessionService struct {
 }
 
 // NewSessionService 创建会话服务
-func NewSessionService(workspaceRepo *store.WorkspaceRepository, sessionRepo *store.SessionRepository, msgRepo *store.MessageRepository, mgr *manager.Manager, defaultCwd string) *SessionService {
+func NewSessionService(workspaceRepo *store.WorkspaceRepository, sessionRepo *store.SessionRepository, msgRepo *store.MessageRepository, streamRepo *store.StreamEventRepository, mgr *manager.Manager, defaultCwd string) *SessionService {
 	return &SessionService{
 		workspaceRepo: workspaceRepo,
 		sessionRepo:   sessionRepo,
 		msgRepo:       msgRepo,
+		streamRepo:    streamRepo,
 		mgr:           mgr,
 		defaultCwd:    defaultCwd,
 	}
@@ -343,6 +345,10 @@ func (s *SessionService) DeleteSession(id uint) error {
 	}
 
 	// 先删 DB：此后该会话在前端不可见，删除语义即完成
+	if err := s.streamRepo.DeleteBySession(id); err != nil {
+		// 流式事件表删除失败不阻断删除，仅记录；会话和消息已删除，可接受少量孤儿行。
+		slog.Warn("failed to delete stream events", "sessionID", id, "err", err)
+	}
 	if err := s.msgRepo.DeleteBySession(id); err != nil {
 		return fmt.Errorf("failed to delete messages: %w", err)
 	}
@@ -442,6 +448,9 @@ func (s *SessionService) DeleteDraftSession(id uint) error {
 	}
 
 	// 草稿正常无消息，防御性删除防历史脏数据留孤儿行
+	if err := s.streamRepo.DeleteBySession(id); err != nil {
+		slog.Warn("failed to delete draft stream events", "sessionID", id, "err", err)
+	}
 	if err := s.msgRepo.DeleteBySession(id); err != nil {
 		return fmt.Errorf("failed to delete draft messages: %w", err)
 	}

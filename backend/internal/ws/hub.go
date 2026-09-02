@@ -26,7 +26,6 @@ type Client struct {
 // Hub 管理所有 WebSocket 连接
 type Hub struct {
 	clients    map[*Client]bool
-	broadcast  chan []byte
 	register   chan *Client
 	unregister chan *Client
 	mu         sync.RWMutex
@@ -36,7 +35,6 @@ type Hub struct {
 // NewHub 创建新的 Hub
 func NewHub(log *slog.Logger) *Hub {
 	return &Hub{
-		broadcast:  make(chan []byte),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		clients:    make(map[*Client]bool),
@@ -62,20 +60,6 @@ func (h *Hub) Run() {
 			}
 			h.mu.Unlock()
 			h.log.Info("client disconnected", "total", len(h.clients))
-
-		case message := <-h.broadcast:
-			h.mu.RLock()
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					// 客户端发送缓冲区满，断开连接
-					go func(c *Client) {
-						h.unregister <- c
-					}(client)
-				}
-			}
-			h.mu.RUnlock()
 		}
 	}
 }
@@ -85,7 +69,7 @@ func (h *Hub) NewClient(conn *websocket.Conn) *Client {
 	client := &Client{
 		hub:  h,
 		conn: conn,
-		send: make(chan []byte, 256),
+		send: make(chan []byte, 1024),
 	}
 	h.register <- client
 	return client
@@ -243,15 +227,15 @@ func (c *Client) handleMessage(ctx context.Context, msg ClientMessage) {
 		if msg.SessionID != "" {
 			c.SubscribeSession(msg.SessionID, msg.AgentID)
 		}
-		running := false
 		if bridge != nil {
-			running = bridge.HasPromptInProgress(msg.AgentID, msg.SessionID)
+			bridge.ResyncClient(c, msg.SessionID, msg.AgentID)
+		} else {
+			c.Send(ServerMessage{
+				Type:      MsgTypeSessionResynced,
+				SessionID: msg.SessionID,
+				Running:   false,
+			})
 		}
-		c.Send(ServerMessage{
-			Type:      MsgTypeSessionResynced,
-			SessionID: msg.SessionID,
-			Running:   running,
-		})
 
 	case MsgTypePing:
 		c.Send(ServerMessage{Type: MsgTypePong})

@@ -161,6 +161,11 @@ func runMigrations(db *gorm.DB) error {
 			Name:    "messages_tool_details",
 			Func:    migrateV6,
 		},
+		{
+			Version: 7,
+			Name:    "create_stream_events",
+			Func:    migrateV7,
+		},
 	}
 
 	// 执行未应用的迁移

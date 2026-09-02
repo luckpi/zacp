@@ -152,6 +152,7 @@ Examples:
 	workspaceRepo := store.NewWorkspaceRepository(st.DB)
 	sessionRepo := store.NewSessionRepository(st.DB)
 	messageRepo := store.NewMessageRepository(st.DB)
+	streamEventRepo := store.NewStreamEventRepository(st.DB)
 
 	// 启动清理：物理删除历史软删的空草稿会话（隐式 /new 探测产生的临时会话，
 	// 无恢复入口也无保留价值）。清理失败仅告警，不阻塞启动。
@@ -204,7 +205,7 @@ Examples:
 	wsHandler := ws.NewHandler(wsHub, log, authSvc)
 
 	// 创建 EventBridge
-	eventBridge := ws.NewEventBridge(wsHandler, mgr, sessionRepo, messageRepo, log)
+	eventBridge := ws.NewEventBridge(wsHandler, mgr, sessionRepo, messageRepo, streamEventRepo, log)
 	// 注入「prompt 开始执行」钩子：全局三槽位获取成功（真正执行）时才注册
 	// 该会话的事件回调并广播 turn.started，排队期间不注册，避免回调覆盖。
 	// 事件本身携带 ACP session id，多个并行会话按 id 路由。
@@ -215,7 +216,7 @@ Examples:
 
 	// 创建 Service
 	workspaceSvc := service.NewWorkspaceService(workspaceRepo)
-	sessionSvc := service.NewSessionService(workspaceRepo, sessionRepo, messageRepo, mgr, cfg.Session.DefaultCwd)
+	sessionSvc := service.NewSessionService(workspaceRepo, sessionRepo, messageRepo, streamEventRepo, mgr, cfg.Session.DefaultCwd)
 	// REST 路径（SendMessage/SetConfigOption）重建 ACP 会话后，同样迁移 WS 订阅
 	//（与 ws bridge 的 prompt 路径一致：前端订阅旧 id 时，重建后的广播不丢失）。
 	sessionSvc.OnSessionRebuilt = func(oldID, newID string) {

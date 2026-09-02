@@ -357,3 +357,51 @@ func (r *MessageRepository) DeleteBySession(sessionID uint) error {
 	return r.db.Where("session_id = ?", sessionID).
 		Delete(&model.Message{}).Error
 }
+
+// GetLastAssistantBySession 返回会话最近一条 assistant 消息。
+// 用于 ZACP 重启后判断 stream_events 是否属于已经正常收尾的 turn，避免重复补全。
+func (r *MessageRepository) GetLastAssistantBySession(sessionID uint) (*model.Message, error) {
+	var message model.Message
+	err := r.db.Where("session_id = ? AND role = ?", sessionID, "assistant").
+		Order("id DESC").
+		Limit(1).
+		First(&message).Error
+	if err != nil {
+		return nil, err
+	}
+	return &message, nil
+}
+
+// StreamEventRepository 流式事件临时持久化。
+// 事件按 ZACP 会话归属：正常 turn 结束后清理，崩溃/重启后由 resync 逻辑补齐为历史消息。
+type StreamEventRepository struct {
+	db *gorm.DB
+}
+
+// NewStreamEventRepository 创建流式事件仓储。
+func NewStreamEventRepository(db *gorm.DB) *StreamEventRepository {
+	return &StreamEventRepository{db: db}
+}
+
+// Create 追加一条流式事件。
+func (r *StreamEventRepository) Create(sessionID uint, data []byte) error {
+	return r.db.Create(&model.StreamEvent{
+		SessionID: sessionID,
+		Data:      string(data),
+	}).Error
+}
+
+// ListBySession 列出会话暂存的所有事件，按创建时间升序。
+func (r *StreamEventRepository) ListBySession(sessionID uint) ([]model.StreamEvent, error) {
+	var events []model.StreamEvent
+	err := r.db.Where("session_id = ?", sessionID).
+		Order("created_at ASC").
+		Find(&events).Error
+	return events, err
+}
+
+// DeleteBySession 删除会话的所有临时事件。
+func (r *StreamEventRepository) DeleteBySession(sessionID uint) error {
+	return r.db.Where("session_id = ?", sessionID).
+		Delete(&model.StreamEvent{}).Error
+}

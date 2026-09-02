@@ -25,6 +25,7 @@ type EventBridge struct {
 	manager     *manager.Manager
 	sessionRepo *store.SessionRepository
 	msgRepo     *store.MessageRepository
+	streamRepo  *store.StreamEventRepository
 	log         *slog.Logger
 
 	// promptOrderTail 让 WS 按收到帧的顺序进入 Manager 全局 FIFO；前置落库耗时
@@ -35,6 +36,12 @@ type EventBridge struct {
 	// pendingPermissions 等待前端回传的权限请求（permissionID → 响应通道）。
 	// ACP 请求自身带 sessionId，因此多个 session 可独立挂起，不依赖 Agent 的单一当前会话。
 	pendingPermissions sync.Map
+
+	// acpSessionMap 缓存 ACP session id → ZACP DB session id。
+	// 事件持久化/清理需要按 ZACP session 落库；ACP session id 会在 recoverSession 时改变，
+	// 因此 recoverSession 后必须同步更新本映射。
+	acpSessionMu sync.RWMutex
+	acpSessionMap map[string]uint
 }
 
 // permissionTimeout 前端未响应权限请求的等待上限；超时自动取消，避免阻塞 agent turn。
@@ -42,7 +49,7 @@ type EventBridge struct {
 const permissionTimeout = 5 * time.Minute
 
 // NewEventBridge 创建事件桥接器
-func NewEventBridge(handler *Handler, mgr *manager.Manager, sessionRepo *store.SessionRepository, msgRepo *store.MessageRepository, log *slog.Logger) *EventBridge {
+func NewEventBridge(handler *Handler, mgr *manager.Manager, sessionRepo *store.SessionRepository, msgRepo *store.MessageRepository, streamRepo *store.StreamEventRepository, log *slog.Logger) *EventBridge {
 	ready := make(chan struct{})
 	close(ready)
 	return &EventBridge{
@@ -50,8 +57,10 @@ func NewEventBridge(handler *Handler, mgr *manager.Manager, sessionRepo *store.S
 		manager:         mgr,
 		sessionRepo:     sessionRepo,
 		msgRepo:         msgRepo,
+		streamRepo:      streamRepo,
 		log:             log,
 		promptOrderTail: ready,
+		acpSessionMap:   make(map[string]uint),
 	}
 }
 
@@ -97,6 +106,64 @@ func (b *EventBridge) Log() *slog.Logger {
 	return b.log
 }
 
+// cacheSessionID 按 ACP session id 缓存对应的 ZACP DB session id。
+// 缓存 miss 时回查数据库；查不到返回 0 与 false。
+func (b *EventBridge) cacheSessionID(acpSessionID string) (uint, bool) {
+	b.acpSessionMu.RLock()
+	id, ok := b.acpSessionMap[acpSessionID]
+	b.acpSessionMu.RUnlock()
+	if ok {
+		return id, true
+	}
+
+	dbSession, err := b.sessionRepo.GetByACPSessionID(acpSessionID)
+	if err != nil {
+		return 0, false
+	}
+
+	b.acpSessionMu.Lock()
+	b.acpSessionMap[acpSessionID] = dbSession.ID
+	b.acpSessionMu.Unlock()
+	return dbSession.ID, true
+}
+
+// dbSessionIDFor 获取 ACP session id 对应的 ZACP DB session id（优先缓存）。
+func (b *EventBridge) dbSessionIDFor(acpSessionID string) (uint, bool) {
+	b.acpSessionMu.RLock()
+	id, ok := b.acpSessionMap[acpSessionID]
+	b.acpSessionMu.RUnlock()
+	if ok {
+		return id, true
+	}
+	return b.cacheSessionID(acpSessionID)
+}
+
+// bindPersistHandlers 为 Bridge 注入事件持久化/清理回调。
+// 每个 Bridge 只需注入一次；幂等，重复调用以最新回调为准。
+func (b *EventBridge) bindPersistHandlers(bridge *client.Bridge) {
+	bridge.SetPersistHandler(func(event client.Event) error {
+		dbSessionID, ok := b.dbSessionIDFor(event.SessionID)
+		if !ok {
+			// 按 ACP session id 查不到会话（如隐式探测阶段），无法落库；丢弃并记录。
+			b.log.Debug("drop stream event for unknown session", "sessionID", event.SessionID)
+			return nil
+		}
+		data, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+		return b.streamRepo.Create(dbSessionID, data)
+	})
+
+	bridge.SetPersistResetHandler(func(acpSessionID string) error {
+		dbSessionID, ok := b.dbSessionIDFor(acpSessionID)
+		if !ok {
+			return nil
+		}
+		return b.streamRepo.DeleteBySession(dbSessionID)
+	})
+}
+
 // EnsureSessionUpdateHandlers 提前注册「按通知 sessionId 分发」的 session/update 处理器
 // （configOptions、availableCommands），用于在会话创建（session/new）之前调用。
 // 原因：部分 agent（如 reasonix）在 session/new 响应返回的同一时刻同步推送
@@ -133,6 +200,11 @@ func (b *EventBridge) SetupEventCallback(agentID, sessionID string) error {
 	if err != nil {
 		return err
 	}
+
+	// 缓存 ACP session id → DB session id，供事件持久化/清理使用；
+	// 同时注入持久化回调（幂等，重复设置无影响）。
+	b.cacheSessionID(sessionID)
+	b.bindPersistHandlers(bridge)
 
 	// 事件按事件自身携带的 ACP session id 分发（client.Event.SessionID 来自
 	// SDK session/update 通知的 SessionId），并发 session 不会互相覆盖。
@@ -297,9 +369,8 @@ func (b *EventBridge) applySessionInfo(dbSession *model.Session, title string) {
 	b.log.Info("session title updated by agent", "sessionID", sessionID, "title", title)
 }
 
-// handleEvent 处理 ACP 事件并广播到 WebSocket
-func (b *EventBridge) handleEvent(sessionID string, event client.Event) {
-	// 将 ACP 事件转换为 WebSocket 事件
+// clientEventToWsEvent 将 ACP 事件转换为前端可消费的 WebSocket 事件。
+func clientEventToWsEvent(event client.Event) map[string]interface{} {
 	wsEvent := map[string]interface{}{
 		"type":   event.Type,
 		"text":   event.Text,
@@ -318,9 +389,144 @@ func (b *EventBridge) handleEvent(sessionID string, event client.Event) {
 	if event.Plan != nil {
 		wsEvent["plan"] = event.Plan
 	}
+	return wsEvent
+}
 
-	// 广播事件到该会话的所有连接
-	b.handler.BroadcastEvent(sessionID, wsEvent)
+// handleEvent 处理 ACP 事件并广播到 WebSocket
+func (b *EventBridge) handleEvent(sessionID string, event client.Event) {
+	b.handler.BroadcastEvent(sessionID, clientEventToWsEvent(event))
+}
+
+// ResyncClient 在 WebSocket 重连/刷新后向该客户端推送：
+//  1. 尝试从 stream_events 恢复本轮输出（ZACP 重启场景）
+//  2. session.resynced（告知是否仍在执行）
+//  3. history（提示前端刷新该会话历史消息）
+//  4. 若仍在执行，重放本轮已累积的 ACP 事件，使前端能够续流
+func (b *EventBridge) ResyncClient(client *Client, acpSessionID, agentID string) {
+	running := b.manager.HasPromptInProgress(agentID, acpSessionID)
+
+	// 优先恢复持久化的流式事件：ZACP 进程重启后内存缓存丢失，但 DB 中可能仍有当前 turn 输出。
+	if recovered, err := b.recoverStreamEvents(client, acpSessionID, agentID, running); err != nil {
+		b.log.Warn("recover stream events failed", "sessionID", acpSessionID, "agentID", agentID, "err", err)
+	} else if recovered {
+		// 已把暂存事件补齐为历史消息：running 视为结束，前端通过 history 刷新即可。
+		running = false
+	}
+
+	client.Send(ServerMessage{
+		Type:      MsgTypeSessionResynced,
+		SessionID: acpSessionID,
+		Running:   running,
+	})
+	// 提示前端刷新历史消息（浏览器只做显示，数据库是权威来源）
+	client.Send(ServerMessage{
+		Type:      MsgTypeHistory,
+		SessionID: acpSessionID,
+	})
+
+	if running {
+		if err := b.replayEvents(client, agentID, acpSessionID); err != nil {
+			b.log.Warn("failed to replay session events", "sessionID", acpSessionID, "agentID", agentID, "err", err)
+		}
+	}
+}
+
+// recoverStreamEvents 从 stream_events 恢复当前 turn 事件。
+// - running=true：说明 ACP 仍在执行，把事件恢复到内存缓存并清理 DB，供后续 replayEvents 重放。
+// - running=false：说明 ZACP 可能已重启，把暂存事件补成一条 assistant 历史消息后清理 DB。
+// 返回 (recovered, error)：recovered=true 表示已补齐为历史消息，running 应置 false。
+func (b *EventBridge) recoverStreamEvents(c *Client, acpSessionID, agentID string, running bool) (bool, error) {
+	dbSessionID, ok := b.dbSessionIDFor(acpSessionID)
+	if !ok {
+		return false, nil
+	}
+
+	streamEvents, err := b.streamRepo.ListBySession(dbSessionID)
+	if err != nil {
+		return false, err
+	}
+	if len(streamEvents) == 0 {
+		return false, nil
+	}
+
+	events := make([]client.Event, 0, len(streamEvents))
+	for _, se := range streamEvents {
+		var e client.Event
+		if err := json.Unmarshal([]byte(se.Data), &e); err != nil {
+			b.log.Warn("unmarshal stream event failed", "sessionID", acpSessionID, "err", err)
+			continue
+		}
+		events = append(events, e)
+	}
+	if len(events) == 0 {
+		_ = b.streamRepo.DeleteBySession(dbSessionID)
+		return false, nil
+	}
+
+	if running {
+		// 仍在执行：恢复到 Bridge 内存，然后清理 DB 防止重复恢复。
+		bridge, err := b.manager.GetBridge(agentID)
+		if err != nil {
+			return false, err
+		}
+		bridge.RestoreSession(acpSessionID, events)
+		if err := b.streamRepo.DeleteBySession(dbSessionID); err != nil {
+			b.log.Warn("delete stream events after restore failed", "sessionID", acpSessionID, "err", err)
+		}
+		return false, nil
+	}
+
+	// 未在执行：补齐为一条 assistant 消息，避免 turn 因 ZACP 重启而完全丢失。
+	lastAssistant, err := b.msgRepo.GetLastAssistantBySession(dbSessionID)
+	if err == nil && !lastAssistant.CreatedAt.Before(streamEvents[len(streamEvents)-1].CreatedAt) {
+		// 数据库里已有更新的 assistant 消息，说明 turn 已正常收尾；只清理临时事件。
+		_ = b.streamRepo.DeleteBySession(dbSessionID)
+		return false, nil
+	}
+
+	content := client.EventsText(events)
+	slimEvents, toolDetails := eventstore.SplitToolDetails(events)
+	msg := &model.Message{
+		SessionID:   dbSessionID,
+		Role:        "assistant",
+		Content:     content,
+		Events:      eventstore.Marshal(slimEvents),
+		ToolDetails: eventstore.MarshalDetails(toolDetails),
+		CreatedAt:   time.Now(),
+	}
+	if err := b.msgRepo.Create(msg); err != nil {
+		return false, fmt.Errorf("create recovered assistant message: %w", err)
+	}
+	if err := b.streamRepo.DeleteBySession(dbSessionID); err != nil {
+		b.log.Warn("delete stream events after recovery failed", "sessionID", acpSessionID, "err", err)
+	}
+
+	// 若 Bridge 内存中有同 session 残留事件（理论上不应有），也清掉。
+	if bridge, err := b.manager.GetBridge(agentID); err == nil {
+		bridge.ResetSession(acpSessionID)
+	}
+	return true, nil
+}
+
+// replayEvents 将指定 ACP 会话已缓存的事件按序重放给指定客户端。
+// 用于浏览器断连期间事件仍在缓存中的场景，保证重连后能看到当前轮的完整输出。
+func (b *EventBridge) replayEvents(client *Client, agentID, acpSessionID string) error {
+	bridge, err := b.manager.GetBridge(agentID)
+	if err != nil {
+		return err
+	}
+	events := bridge.Events(acpSessionID)
+	if len(events) == 0 {
+		return nil
+	}
+	for _, event := range events {
+		client.Send(ServerMessage{
+			Type:      MsgTypeEvent,
+			SessionID: acpSessionID,
+			Event:     clientEventToWsEvent(event),
+		})
+	}
+	return nil
 }
 
 // HandlePermissionRequest 处理 agent 的权限请求（在 RequestPermission 回调中同步调用）：
@@ -449,6 +655,8 @@ func (b *EventBridge) handlePrompt(ctx context.Context, sessionID, agentID, mess
 	if err != nil {
 		return fmt.Errorf("session not found: %w", err)
 	}
+	// 缓存 ACP session 与 DB session 的映射，供 ResetSession 清理 stream_events 使用。
+	b.cacheSessionID(sessionID)
 
 	// 落库用户消息（即使 agent 调用失败也保留）
 	userMsg := &model.Message{
@@ -559,6 +767,15 @@ func (b *EventBridge) recoverSession(ctx context.Context, dbSession *model.Sessi
 		if err := b.sessionRepo.UpdateACPSessionID(dbSession.ID, newID); err != nil {
 			b.log.Error("failed to update acp session id in db", "err", err)
 		}
+		// 同步更新 ACP session 映射；若 agent 已重建，新的 Bridge 需要重新注入持久化回调。
+		b.acpSessionMu.Lock()
+		b.acpSessionMap[newID] = dbSession.ID
+		delete(b.acpSessionMap, oldAcpID)
+		b.acpSessionMu.Unlock()
+		if bridge, err := b.manager.GetBridge(agentID); err == nil {
+			b.bindPersistHandlers(bridge)
+		}
+
 		// 订阅迁移必须在重试 prompt 之前完成：HandlePrompt 的重试在 recoverSession
 		// 返回后执行，随后的 turn.started/event/turn.done 广播都走新 id，
 		// 只有迁移后的连接才能收到（另有 session.recovered 消息让前端更新映射）。

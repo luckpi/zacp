@@ -13,6 +13,7 @@ const (
 
 	// 服务端 → 客户端
 	MsgTypeSessionReady      MessageType = "session.ready"      // 会话就绪确认
+	MsgTypeHistory           MessageType = "history"            // 重连/进入会话后推送，提示前端刷新该会话历史消息
 	MsgTypeEvent             MessageType = "event"              // 流式事件（token、工具调用等）
 	MsgTypeTurnStarted       MessageType = "turn.started"       // 一轮对话真正开始执行（排队门闩获取成功；前端据此把「排队中」切换为流式）
 	MsgTypeTurnDone          MessageType = "turn.done"          // 一轮对话完成

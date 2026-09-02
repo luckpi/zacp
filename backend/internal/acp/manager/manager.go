@@ -232,6 +232,21 @@ func IsPromptCancelledErr(err error) bool {
 	return errors.Is(err, ErrPromptCancelled)
 }
 
+// IsConnectionErr 判断 ACP 错误是否为「与 agent 的底层连接已断开」。
+// acp-go-sdk 在 notification queue 溢出、peer 关闭 stdout、进程死亡等场景下会返回
+// 这类错误；ZACP 不能把它当普通业务错误直接抛给前端，而应重启 agent 并重试。
+func IsConnectionErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "peer disconnected") ||
+		strings.Contains(msg, "connection closed") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "eof")
+}
+
 // HasPromptInProgress 报告指定 agent+ACP session 是否正处于 prompt 执行/排队中。
 // 供 WS resync 使用：页面刷新/重连后据此恢复「正在执行」会话的实时流。
 func (m *Manager) HasPromptInProgress(agentID, sessionID string) bool {
@@ -438,7 +453,7 @@ func (m *Manager) EnsureStarted(ctx context.Context, agentID string) error {
 	m.mu.Unlock()
 	if exists {
 		conn.mu.Lock()
-		running := conn.started
+		running := conn.started && conn.isConnAlive()
 		conn.mu.Unlock()
 		if running {
 			return nil
@@ -745,6 +760,17 @@ func IsUnknownSessionErr(err error) bool {
 	if err == nil {
 		return false
 	}
+
+	// 优先检查 ACP JSON-RPC 错误的结构化 Data：Devin 等 agent 会在 data 里
+	// 携带 cognition.ai/errorKind = "session_not_found"，比文本匹配更可靠，
+	// 也不需要依赖错误文本里出现 UUID/hex。
+	var reqErr *acp.RequestError
+	if errors.As(err, &reqErr) && reqErr != nil {
+		if isSessionNotFoundData(reqErr.Data) {
+			return true
+		}
+	}
+
 	msg := strings.ToLower(err.Error())
 	if !strings.Contains(msg, "session") || !uuidLikeRe.MatchString(msg) {
 		return false
@@ -765,6 +791,21 @@ func IsUnknownSessionErr(err error) bool {
 		if strings.Contains(msg, word) {
 			return true
 		}
+	}
+	return false
+}
+
+// isSessionNotFoundData 判断 ACP 错误的 Data 字段是否明确标识为会话不存在/失效。
+func isSessionNotFoundData(data any) bool {
+	if data == nil {
+		return false
+	}
+	m, ok := data.(map[string]any)
+	if !ok {
+		return false
+	}
+	if kind, ok := m["cognition.ai/errorKind"].(string); ok {
+		return strings.Contains(strings.ToLower(kind), "session_not_found")
 	}
 	return false
 }
@@ -832,7 +873,7 @@ func (m *Manager) acquireAgent(ctx context.Context, agentID string) (*AgentConne
 		if conn, ok := m.agents[agentID]; ok {
 			// started 必须持 conn.mu 读：cmd.Wait goroutine 只持 conn.mu 写它
 			conn.mu.Lock()
-			running := conn.started
+			running := conn.started && conn.isConnAlive()
 			if running {
 				conn.activePrompts++
 				conn.lastUsed = time.Now()
@@ -916,8 +957,26 @@ func (m *Manager) prompt(ctx context.Context, agentID, sessionID, message string
 	if err != nil {
 		return nil, err
 	}
-	defer m.releaseAgent(conn)
-	return conn.Prompt(ctx, acp.SessionId(sessionID), message)
+
+	result, err := conn.Prompt(ctx, acp.SessionId(sessionID), message)
+	if err != nil && IsConnectionErr(err) {
+		// 连接在拿到后断开（如 notification queue 溢出导致 conn.Done 关闭）：
+		// 释放旧连接、重启 agent，重试一次。重启后 session 可能已丢失，
+		// 重试若返回 Session not found，由上层 handlePrompt 走 RecoverSession 兜底。
+		m.releaseAgent(conn)
+		_ = m.StopAgent(agentID)
+		if startErr := m.StartAgent(ctx, agentID); startErr != nil {
+			return nil, fmt.Errorf("reconnect agent: %w", startErr)
+		}
+		conn, err = m.acquireAgent(ctx, agentID)
+		if err != nil {
+			return nil, err
+		}
+		result, err = conn.Prompt(ctx, acp.SessionId(sessionID), message)
+	}
+
+	m.releaseAgent(conn)
+	return result, err
 }
 
 // Cancel 取消指定 session 的 prompt：排队中的撤销 FIFO 等待，执行中的发送 ACP cancel。
@@ -1063,10 +1122,12 @@ type AgentConnection struct {
 	cmd           *exec.Cmd
 	conn          *acp.ClientSideConnection
 	stdin         io.WriteCloser
+	stdoutPipe    *io.PipeReader // acp-go-sdk 实际读取的 stdout；中间加 io.Pipe 做反压
 	sessions      map[acp.SessionId]*SessionState
 	lastSessionID acp.SessionId
 	started       bool
 	procCancel    context.CancelFunc
+	closeOnce     sync.Once      // 确保进程与连接只清理一次
 
 	// onPromptStarted 在 Manager 的全局槽位获取成功后调用：此时 prompt
 	// 即将发送，事件回调按 ACP session id 路由，不再依赖单一当前 session。
@@ -1119,6 +1180,20 @@ func (c *AgentConnection) Bridge() *acpclient.Bridge {
 	return c.bridge
 }
 
+// isConnAlive 非阻塞地检查底层 ACP 连接是否仍存活（conn 未 Done）。
+// 须在 c.mu 保护下调用，避免 conn 被并发置 nil。
+func (c *AgentConnection) isConnAlive() bool {
+	if c.conn == nil {
+		return false
+	}
+	select {
+	case <-c.conn.Done():
+		return false
+	default:
+		return true
+	}
+}
+
 // Start 启动 agent 进程并初始化 ACP。
 func (c *AgentConnection) Start(ctx context.Context) error {
 	c.mu.Lock()
@@ -1154,8 +1229,19 @@ func (c *AgentConnection) Start(ctx context.Context) error {
 		return fmt.Errorf("start %s: %w", c.provider.Command, err)
 	}
 
+	// 在 devin 等 agent 的 stdout 与 acp-go-sdk 之间加一道同步 io.Pipe：
+	// SDK 的 notificationQueue 只有 1024，若 devin 瞬时推送大量 session/update
+	// 通知，SDK 会直接关闭连接。通过同步 Pipe 让 devin 写端阻塞，实现反压，
+	// 避免队列溢出导致连接死亡。
+	pr, pw := io.Pipe()
+	go func(stdout io.ReadCloser, pw *io.PipeWriter) {
+		_, _ = io.Copy(pw, stdout)
+		_ = stdout.Close()
+		_ = pw.Close()
+	}(stdout, pw)
+
 	// 初始化 ACP
-	conn := acp.NewClientSideConnection(c.bridge, stdin, stdout)
+	conn := acp.NewClientSideConnection(c.bridge, stdin, pr)
 	conn.SetLogger(c.log)
 
 	initResp, err := conn.Initialize(ctx, acp.InitializeRequest{
@@ -1178,6 +1264,9 @@ func (c *AgentConnection) Start(ctx context.Context) error {
 		procCancel()
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+		// 关闭 pipe 让 io.Copy 协程退出，避免泄漏。
+		_ = pr.CloseWithError(fmt.Errorf("acp initialize failed"))
+		_ = stdin.Close()
 		return fmt.Errorf("acp initialize: %w", err)
 	}
 	c.log.Info("acp initialized", "agent", c.provider.ID, "protocol", initResp.ProtocolVersion)
@@ -1185,27 +1274,21 @@ func (c *AgentConnection) Start(ctx context.Context) error {
 	c.cmd = cmd
 	c.conn = conn
 	c.stdin = stdin
+	c.stdoutPipe = pr
 	c.started = true
 	c.procCancel = procCancel
+	c.closeOnce = sync.Once{}
 
-	// 后台回收进程
+	// 后台回收进程：进程自然退出时清理状态。
 	go func() {
 		err := cmd.Wait()
 		c.log.Info("agent process exited", "agent", c.provider.ID, "err", err)
-		c.mu.Lock()
-		if c.cmd == cmd {
-			c.started = false
-			// 进程退出后底层 ACP 连接和其中所有 session 都失效；清空内存索引，
-			// 后续 prompt 由恢复逻辑按 DB 中的 session id 逐个 load/recreate。
-			c.sessions = make(map[acp.SessionId]*SessionState)
-			c.lastSessionID = ""
-			c.conn = nil
-			c.stdin = nil
-			c.cmd = nil
-			c.procCancel = nil
-		}
-		c.mu.Unlock()
+		c.Close()
 	}()
+
+	// 监听 ACP 连接是否被对端/Sdk 主动关闭（如 notification queue 溢出），
+	// 发现后立即杀进程并清理状态，下次 prompt 会按需重新拉起 devin。
+	go c.watchConnDone(conn)
 
 	return nil
 }
@@ -1541,22 +1624,44 @@ func (c *AgentConnection) SetSessionConfigOptionBoolean(ctx context.Context, ses
 	return nil
 }
 
-// Close 关闭 agent 连接。
-func (c *AgentConnection) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// watchConnDone 监听 acp-go-sdk 连接关闭，发现后统一走 Close 清理。
+// SDK 因 notification queue 溢出或 peer 断开时会关闭 conn.Done()，此时尚未通知
+// Manager，需要主动杀进程、清理状态，否则后续 prompt 会一直拿到死连接。
+func (c *AgentConnection) watchConnDone(conn *acp.ClientSideConnection) {
+	<-conn.Done()
+	c.log.Warn("acp connection closed, cleaning up", "agent", c.provider.ID)
+	c.Close()
+}
 
-	if c.procCancel != nil {
-		c.procCancel()
-		c.procCancel = nil
-	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-	}
-	if c.stdin != nil {
-		_ = c.stdin.Close()
-	}
-	c.started = false
+// Close 关闭 agent 连接（幂等）。
+func (c *AgentConnection) Close() error {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		if c.onAgentForceKilled != nil {
+			c.onAgentForceKilled()
+		}
+		if c.procCancel != nil {
+			c.procCancel()
+			c.procCancel = nil
+		}
+		if c.stdin != nil {
+			_ = c.stdin.Close()
+			c.stdin = nil
+		}
+		if c.stdoutPipe != nil {
+			// 关闭 read 端让 io.Copy / SDK receive 都退出。
+			_ = c.stdoutPipe.Close()
+			c.stdoutPipe = nil
+		}
+		if c.cmd != nil && c.cmd.Process != nil {
+			_ = c.cmd.Process.Kill()
+		}
+		c.started = false
+		c.conn = nil
+		c.sessions = make(map[acp.SessionId]*SessionState)
+		c.lastSessionID = ""
+		c.mu.Unlock()
+	})
 	return nil
 }
 

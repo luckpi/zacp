@@ -88,6 +88,19 @@ type Message struct {
 // TableName 指定表名。
 func (Message) TableName() string { return "messages" }
 
+// StreamEvent 暂存 ACP 流式事件。
+// 当 ZACP 进程崩溃/重启时，当前进行中的 turn 的事件可以从本表恢复并补全为历史消息，
+// 避免浏览器端已收到的流式输出全部丢失。
+type StreamEvent struct {
+	ID        uint      `gorm:"primaryKey" json:"-"`
+	SessionID uint      `gorm:"index;not null" json:"-"`    // 所属 ZACP 会话
+	Data      string    `gorm:"type:text;not null" json:"-"` // 事件 JSON
+	CreatedAt time.Time `json:"-"`
+}
+
+// TableName 指定表名。
+func (StreamEvent) TableName() string { return "stream_events" }
+
 // SchemaMigration 记录已执行的数据库迁移版本。
 type SchemaMigration struct {
 	Version   int       `gorm:"primaryKey" json:"version"`

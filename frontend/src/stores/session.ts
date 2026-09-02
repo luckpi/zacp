@@ -1528,6 +1528,13 @@ export const useSessionStore = defineStore('session', () => {
           }
           break
         }
+        case 'history': {
+          // 重连/进入会话后服务端提示刷新历史：数据库是权威来源，浏览器只做显示。
+          if (sid !== null) {
+            void loadMessages(sid, true)
+          }
+          break
+        }
         case 'session.recovered': {
           // ACP 会话被后端重建（服务端/agent 重启后旧 id 失效；订阅已由后端自动迁移）：
           // 同步本地 id 映射（旧 ACP id → 新 ACP id），否则后续 event/turn.done 广播

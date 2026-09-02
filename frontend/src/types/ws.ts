@@ -62,6 +62,7 @@ export interface PermissionToolCall {
  * 把事件路由到对应 DB 会话的流式槽位，避免串台。 */
 export type WsServerMessage =
   | { type: 'session.ready'; sessionId?: string; agentId?: string }
+  | { type: 'history'; sessionId?: string }
   | { type: 'event'; sessionId?: string; event: WsEvent }
   | { type: 'turn.started'; sessionId?: string }
   | { type: 'turn.done'; sessionId?: string; reply?: string; stopReason?: string }

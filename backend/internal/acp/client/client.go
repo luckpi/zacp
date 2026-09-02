@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -53,6 +54,13 @@ type Event struct {
 const maxEventsPerSession = 5000
 const keepEventsPerSession = 4000
 
+// persistItem 是 persistCh 的队列单元。
+// done 非 nil 表示 flush 标记：worker 处理到该标记时关闭 done，通知发送方已追上。
+type persistItem struct {
+	event Event
+	done  chan struct{}
+}
+
 type Bridge struct {
 	log         *slog.Logger
 	autoApprove bool
@@ -76,6 +84,19 @@ type Bridge struct {
 	sessionInfoHandler func(sessionID string, info acp.SessionSessionInfoUpdate)
 	// permissionHandler 将权限请求转发给外部（如 WebSocket 前端交互式选择）。
 	permissionHandler func(acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error)
+
+	// liveCh 解耦 ACP 事件接收与 WebSocket 广播：SDK 的 processNotifications 无需
+	// 等待前端消费即可快速返回，避免 notification queue 因消费慢而溢出。
+	// 事件本身仍先落 eventsBySession 缓存，因此即使 liveCh 满载被丢弃，也能在重连时重放。
+	liveCh chan Event
+
+	// persistCh 异步持久化事件到 DB：ZACP 进程重启后，当前 turn 的已产生输出可恢复。
+	// push 只把事件塞入 channel，由 persistWorker 写入，避免阻塞 SDK 通知处理。
+	persistCh chan persistItem
+	// onPersist 可选的外部持久化回调（由 EventBridge 注入，写入 SQLite）。
+	onPersist func(Event) error
+	// onPersistReset 可选的清理回调：新 prompt 开始/结束时删除旧持久化事件。
+	onPersistReset func(string) error
 }
 
 // Ensure Bridge implements acp.Client.
@@ -86,12 +107,17 @@ func New(log *slog.Logger, autoApprove bool) *Bridge {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Bridge{
+	b := &Bridge{
 		log:             log,
 		autoApprove:     autoApprove,
 		eventsBySession: make(map[string][]Event),
 		mutedSessions:   make(map[string]bool),
+		liveCh:          make(chan Event, 1024),
+		persistCh:       make(chan persistItem, 1024),
 	}
+	go b.liveWorker()
+	go b.persistWorker()
+	return b
 }
 
 // SetOnEvent sets a live event sink (optional).
@@ -99,6 +125,22 @@ func (b *Bridge) SetOnEvent(fn func(Event)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.onEvent = fn
+}
+
+// SetPersistHandler 注入事件持久化回调（可选）。
+// 由 EventBridge 注入，将每个事件异步写入 DB，供 ZACP 重启后恢复当前 turn。
+func (b *Bridge) SetPersistHandler(fn func(Event) error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onPersist = fn
+}
+
+// SetPersistResetHandler 注入持久化事件清理回调（可选）。
+// 新 prompt 开始/结束时按 ACP session id 清理旧临时事件。
+func (b *Bridge) SetPersistResetHandler(fn func(string) error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onPersistReset = fn
 }
 
 // SetPermissionHandler sets an interactive permission handler (optional).
@@ -137,11 +179,37 @@ func (b *Bridge) SetSessionInfoHandler(fn func(sessionID string, info acp.Sessio
 	b.sessionInfoHandler = fn
 }
 
-// ResetSession clears buffered events for one ACP session.
+// ResetSession 清理指定 ACP session 的内存缓存和已持久化的临时事件。
+// 在 prompt 开始/结束时调用：保证新轮次不会读到旧轮次的残留事件。
 func (b *Bridge) ResetSession(sessionID string) {
+	// 1. 先清内存，防止新事件追加到旧缓存。
+	b.mu.Lock()
+	delete(b.eventsBySession, sessionID)
+	resetFn := b.onPersistReset
+	b.mu.Unlock()
+
+	// 2. 等待尚未持久化的事件处理完，避免清理后旧事件又被写入 DB。
+	b.flushPersist()
+
+	// 3. 删除该会话已持久化的临时流式事件。
+	if resetFn != nil {
+		if err := resetFn(sessionID); err != nil {
+			b.log.Warn("reset persist failed", "sessionID", sessionID, "err", err)
+		}
+	}
+}
+
+// RestoreSession 将外部恢复的事件注入 eventsBySession，用于 ZACP 重启后续流。
+// 若内存中已有同 session 事件，以内存为准，避免覆盖。
+func (b *Bridge) RestoreSession(sessionID string, events []Event) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	delete(b.eventsBySession, sessionID)
+	if len(b.eventsBySession[sessionID]) > 0 {
+		return
+	}
+	out := make([]Event, len(events))
+	copy(out, events)
+	b.eventsBySession[sessionID] = out
 }
 
 // Events returns a copy of buffered events for one ACP session.
@@ -154,10 +222,9 @@ func (b *Bridge) Events(sessionID string) []Event {
 	return out
 }
 
-// AgentText joins all agent message text chunks for one ACP session.
-// 优化：预先估算总长度并 Grow，避免 Builder 多次扩容拷贝。
-func (b *Bridge) AgentText(sessionID string) string {
-	events := b.Events(sessionID)
+// EventsText 拼接事件列表中所有 agent_message 文本。
+// 独立函数：支持从内存缓存或持久化恢复后的事件列表统一计算回复文本。
+func EventsText(events []Event) string {
 	total := 0
 	for _, e := range events {
 		if e.Type == "agent_message" {
@@ -172,6 +239,12 @@ func (b *Bridge) AgentText(sessionID string) string {
 		}
 	}
 	return sb.String()
+}
+
+// AgentText joins all agent message text chunks for one ACP session.
+// 优化：预先估算总长度并 Grow，避免 Builder 多次扩容拷贝。
+func (b *Bridge) AgentText(sessionID string) string {
+	return EventsText(b.Events(sessionID))
 }
 
 // SetMuted 设置/解除指定 ACP session 的事件静音（见 mutedSessions 字段注释）。
@@ -219,10 +292,74 @@ func (b *Bridge) push(e Event) {
 		b.eventsBySession[e.SessionID] = events
 	}
 	b.eventsBySession[e.SessionID] = append(b.eventsBySession[e.SessionID], e)
-	fn := b.onEvent
 	b.mu.Unlock()
-	if fn != nil {
-		fn(e)
+
+	// 事件先入缓存（eventsBySession），再尝试非阻塞地推给 live 分发通道。
+	// 若浏览器/网络消费慢导致 liveCh 满，则丢弃实时广播，但事件不会丢失；
+	// 前端重连时可通过 eventsBySession 重放。这样可以防止 SDK 的 notification queue
+	// 因消费慢而溢出，避免 ACP 连接被关闭。
+	select {
+	case b.liveCh <- e:
+	default:
+		b.log.Warn("live event channel full, dropping live broadcast", "sessionID", e.SessionID)
+	}
+
+	// 同时推入异步持久化队列，使 ZACP 进程重启后能够恢复当前 turn 输出。
+	// 若 persistCh 满，丢弃该事件的持久化（仍保留在内存缓存中），避免阻塞 SDK。
+	if b.onPersist != nil {
+		select {
+		case b.persistCh <- persistItem{event: e}:
+		default:
+			b.log.Warn("persist channel full, dropping persistence", "sessionID", e.SessionID)
+		}
+	}
+}
+
+// liveWorker 将缓存的事件异步广播给前端。
+func (b *Bridge) liveWorker() {
+	for e := range b.liveCh {
+		b.mu.Lock()
+		fn := b.onEvent
+		b.mu.Unlock()
+		if fn != nil {
+			fn(e)
+		}
+	}
+}
+
+// persistWorker 将事件异步写入持久化存储（如 SQLite）。
+// 与 liveWorker 分离：持久化慢不会阻塞实时广播，但事件最终落盘。
+func (b *Bridge) persistWorker() {
+	for item := range b.persistCh {
+		// flush 标记：通知发送方已追上当前队列。
+		if item.done != nil {
+			close(item.done)
+			continue
+		}
+		if b.onPersist == nil {
+			continue
+		}
+		if err := b.onPersist(item.event); err != nil {
+			b.log.Warn("persist event failed", "sessionID", item.event.SessionID, "err", err)
+		}
+	}
+}
+
+// flushPersist 等待 persistCh 中当前已排队的事件全部处理完毕。
+// 用于 ResetSession 前：确保旧事件已落盘或丢弃后再清理 DB，避免残留。
+func (b *Bridge) flushPersist() {
+	done := make(chan struct{})
+	item := persistItem{done: done}
+	select {
+	case b.persistCh <- item:
+	case <-time.After(5 * time.Second):
+		b.log.Warn("flush persist channel enqueue timeout")
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		b.log.Warn("flush persist channel wait timeout")
 	}
 }
 

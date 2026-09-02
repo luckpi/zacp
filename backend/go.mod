@@ -64,3 +64,7 @@ require (
 	modernc.org/memory v1.5.0 // indirect
 	modernc.org/sqlite v1.23.1 // indirect
 )
+
+// ZACP patch: 扩容 acp-go-sdk 的 notification queue，避免 devin session/load
+// 和长流式输出时队列溢出导致连接被关闭。
+replace github.com/coder/acp-go-sdk => ./third_party/acp-go-sdk
