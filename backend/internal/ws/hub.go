@@ -69,7 +69,8 @@ func (h *Hub) NewClient(conn *websocket.Conn) *Client {
 	client := &Client{
 		hub:  h,
 		conn: conn,
-		send: make(chan []byte, 1024),
+		// 发送队列扩至 16384：避免 resync 回放大量事件时因客户端消费慢而丢帧。
+		send: make(chan []byte, 16384),
 	}
 	h.register <- client
 	return client

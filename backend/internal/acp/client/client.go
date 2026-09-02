@@ -112,8 +112,11 @@ func New(log *slog.Logger, autoApprove bool) *Bridge {
 		autoApprove:     autoApprove,
 		eventsBySession: make(map[string][]Event),
 		mutedSessions:   make(map[string]bool),
-		liveCh:          make(chan Event, 1024),
-		persistCh:       make(chan persistItem, 1024),
+		// 缓冲扩至 16384，配合 vendored acp-go-sdk 的大队列，避免高并发事件
+		// 或长输出时因消费慢被丢弃（事件仍保留在内存缓存中，重连可重放）。
+		liveCh:          make(chan Event, 16384),
+		// 持久化通道扩至 4096：减少极端情况下事件未落盘的概率，又不致内存暴涨。
+		persistCh:       make(chan persistItem, 4096),
 	}
 	go b.liveWorker()
 	go b.persistWorker()
