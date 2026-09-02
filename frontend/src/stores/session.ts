@@ -307,6 +307,13 @@ export const useSessionStore = defineStore('session', () => {
    * 按 DB session id 隔离，不能使用全局布尔值（多个会话可并行执行）。
    */
   const initialSessionDetailRefresh = new Map<number, 'pending' | 'done'>()
+  /**
+   * 已发起 resync 的 ACP session id 集合。resync 用于订阅并裁决该会话
+   * 当前是否仍在执行；每次 WS 重连后清空，避免旧连接状态残留。
+   */
+  const resyncedAcpSessionIds = new Set<string>()
+  /** 上一次 WS 是否处于 open 状态，用于检测断线→重连切换。 */
+  let lastResyncSocketOpen = false
 
   function indexAcpSession(session: ChatSession | null | undefined) {
     if (!session?.acpSessionId) return
@@ -316,6 +323,7 @@ export const useSessionStore = defineStore('session', () => {
 	function dropSessionIndexes(sessionId: number) {
 		for (const [acpId, dbId] of dbIdByAcpSession) {
 			if (dbId === sessionId) dbIdByAcpSession.delete(acpId)
+			if (dbId === sessionId) resyncedAcpSessionIds.delete(acpId)
 		}
 		sentSessions.delete(sessionId)
 		initialSessionDetailRefresh.delete(sessionId)
@@ -670,6 +678,9 @@ export const useSessionStore = defineStore('session', () => {
       }
       upsertSession(session)
       sessionResolve.value = { status: 'ready', message: null }
+      // 进入会话时主动 resync：服务端裁决当前 turn 是否仍在执行并触发事件回放/订阅，
+      // 解决「点进运行中的对话没有实时更新、卡在自己消息」的问题。
+      resyncSessionIfNeeded(session)
       await Promise.allSettled([
         loadMessages(sessionId),
         loadConfigOptions(sessionId),
@@ -1365,27 +1376,33 @@ export const useSessionStore = defineStore('session', () => {
   }
 
   /**
+   * 进入/恢复会话时主动发 resync：服务端裁决当前 turn 是否仍在执行，
+   * 并触发事件回放与订阅。点进运行中会话时立即调用，避免前端卡在旧状态。
+   */
+  function resyncSessionIfNeeded(session: ChatSession) {
+    if (acpSocket.state.status !== 'open') return
+    if (!session.acpSessionId) return
+    if (resyncedAcpSessionIds.has(session.acpSessionId)) return
+    acpSocket.send({ type: 'resync', sessionId: session.acpSessionId, agentId: session.agentId })
+    resyncedAcpSessionIds.add(session.acpSessionId)
+  }
+
+  /**
    * 刷新/重连后的续流扫描：对「最近活跃（updatedAt 距今 < RESYNC_ACTIVE_WINDOW_MS）」
-   * 的会话发 resync，由服务端裁决其 ACP turn 是否仍在执行：
+   * 且尚未 resync 的会话发 resync，由服务端裁决其 ACP turn 是否仍在执行：
    * - running=true  → 恢复 streaming + 订阅，后半段实时续流（收尾时落库补全）；
    * - running=false → 已结束，列表本身是 DB 全量，无需额外动作。
-   * 只扫描第一轮：断线重连场景由 P0 保险丝兜底，重复扫描无意义。
+   * 按 ACP session id 去重；每次 WS 重连后清空集合，确保新连接重新订阅。
    */
-  let resyncScanned = false
   function rescanRunningSessions() {
-    if (resyncScanned) {
-      return
-    }
-    resyncScanned = true
+    if (acpSocket.state.status !== 'open') return
     const cutoff = Date.now() - RESYNC_ACTIVE_WINDOW_MS
     for (const s of sessions.value) {
-      if (new Date(s.updatedAt).getTime() < cutoff) {
-        continue
-      }
-      if (!s.acpSessionId) {
-        continue
-      }
+      if (!s.acpSessionId) continue
+      if (resyncedAcpSessionIds.has(s.acpSessionId)) continue
+      if (new Date(s.updatedAt).getTime() < cutoff) continue
       acpSocket.send({ type: 'resync', sessionId: s.acpSessionId, agentId: s.agentId })
+      resyncedAcpSessionIds.add(s.acpSessionId)
     }
   }
 
@@ -1464,10 +1481,12 @@ export const useSessionStore = defineStore('session', () => {
           if (!e || sid === null) {
             break
           }
-          // 排队 → 流式兜底：正常由 turn.started 切换；此处兜底旧后端或
-          // 广播丢失场景——收到本会话事件说明 agent 已开始处理
-          if (statusOf(sid) === 'queued') {
+          // 排队/idle → 流式兜底：正常由 turn.started 切换；此处兜底旧后端、
+          // 广播丢失或从其它客户端开始的 turn（resync 前事件先到）——
+          // 收到本会话事件说明 agent 已开始处理。
+          if (sid !== null && (statusOf(sid) === 'queued' || statusOf(sid) === 'idle')) {
             statusBySession.value[sid] = 'streaming'
+            runningSessionIds.value.add(sid)
           }
           if (e.type === 'agent_message' && e.text) {
             // 流式文本事件：追加到占位消息
@@ -1521,10 +1540,12 @@ export const useSessionStore = defineStore('session', () => {
           break
         }
         case 'turn.started': {
-          // 全局三槽位获取成功、agent 开始处理本会话 prompt：queued → streaming。
-          // 立即执行的会话几乎瞬间收到，真正排队的会话在轮到自己时才收到。
-          if (sid !== null && statusOf(sid) === 'queued') {
+          // 全局三槽位获取成功、agent 开始处理本会话 prompt：queued/idle → streaming。
+          // 立即执行的会话几乎瞬间收到；若本客户端未经历 queued（从其它客户端开始
+          // 或 resync 后 turn.started 迟到），idle 也要切换，否则事件追加无流式态。
+          if (sid !== null && (statusOf(sid) === 'queued' || statusOf(sid) === 'idle')) {
             statusBySession.value[sid] = 'streaming'
+            runningSessionIds.value.add(sid)
           }
           break
         }
@@ -1570,17 +1591,18 @@ export const useSessionStore = defineStore('session', () => {
         }
         case 'session.resynced': {
           // 刷新/重连后的续流裁决（sid 已在此前统一解析；sessionId 为 ACP id）：
-          // running=true 且当前无人主动操作（idle）→ 恢复 streaming + 占位，
+          // running=true 且当前处于 idle/queued → 恢复 streaming + 占位，
           // 后续事件继续实时追加；running=false 说明会话已结束，列表本就是
-          // DB 全量，无需额外动作；用户已发新消息（非 idle）时不覆盖其状态。
+          // DB 全量，无需额外动作；已在流式/cancelling 时不覆盖其状态。
           if (sid === null) {
             break
           }
-          if (msg.running && statusOf(sid) === 'idle') {
+          const currentStatus = statusOf(sid)
+          if (msg.running && (currentStatus === 'idle' || currentStatus === 'queued')) {
             statusBySession.value[sid] = 'streaming'
             runningSessionIds.value.add(sid)
             createStreamPlaceholder(sid)
-          } else if (statusOf(sid) === 'idle' && streamMsgIdBySession.value[sid] !== undefined) {
+          } else if (currentStatus === 'idle' && streamMsgIdBySession.value[sid] !== undefined) {
             // 竞态：事件先于 resync 响应到达时兜底建了占位，但后端裁决已结束
             //（turn 恰在此刻收尾）。走一次收尾：增量拉取把已落库结果补全，
             // 无落库则清理残留占位，避免空白气泡。
@@ -1606,8 +1628,11 @@ export const useSessionStore = defineStore('session', () => {
         }
         case 'permission.request': {
           // 权限请求按 DB session id 入队：后台 session 的请求不会覆盖当前窗口。
-          if (sid !== null && statusOf(sid) === 'queued') {
+          // 若本客户端此前未感知到 turn 开始（idle/resync 迟到等），权限请求说明
+          // agent 正在处理，切换为 streaming。
+          if (sid !== null && (statusOf(sid) === 'queued' || statusOf(sid) === 'idle')) {
             statusBySession.value[sid] = 'streaming'
+            runningSessionIds.value.add(sid)
           }
           if (sid !== null) {
             const queue = pendingPermissionsBySession.value[sid] ?? (pendingPermissionsBySession.value[sid] = [])
@@ -1771,11 +1796,16 @@ export const useSessionStore = defineStore('session', () => {
     void checkStalledTurns()
   }, TURN_FUSE_INTERVAL_MS)
   // 刷新/重连后的续流恢复：WS 建立且会话列表就绪后，对最近活跃会话发 resync
-  // （服务端裁决是否仍在执行；只扫一轮，见 rescanRunningSessions）
+  // （服务端裁决是否仍在执行；按 ACP session id 去重，重连后清空集合重新扫描）
   watch(
     [() => acpSocket.state.status, () => sessions.value.length],
     ([status, sessionCount]) => {
-      if (status === 'open' && sessionCount > 0) {
+      const isOpen = status === 'open'
+      if (isOpen && !lastResyncSocketOpen) {
+        resyncedAcpSessionIds.clear()
+      }
+      lastResyncSocketOpen = isOpen
+      if (isOpen && sessionCount > 0) {
         rescanRunningSessions()
       }
     },
